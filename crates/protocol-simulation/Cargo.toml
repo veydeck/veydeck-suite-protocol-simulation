@@ -1,0 +1,32 @@
+[package]
+name = "protocol-simulation"
+version = "0.1.0-alpha.1"
+edition.workspace = true
+
+[dependencies]
+protocol-simulation-common = { path = "../protocol-simulation-common" }
+veydeck-suite-runtime-sdk.workspace = true
+
+anyhow.workspace = true
+axum.workspace = true
+base64.workspace = true
+ring = "0.17"
+blake2b_simd = "1"
+semver = "1"
+constant_time_eq = "0.4"
+chrono.workspace = true
+flate2.workspace = true
+prost.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
+tar.workspace = true
+tokio.workspace = true
+tower-http.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile = "3.23"

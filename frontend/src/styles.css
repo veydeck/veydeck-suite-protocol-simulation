@@ -1,0 +1,26 @@
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#app {
+  margin: 0;
+  min-width: 320px;
+  width: 100%;
+  height: 100%;
+  min-height: 100vh;
+}
+
+body {
+  font-family: var(--vdl-font-family);
+  background: var(--vdl-bg-canvas);
+  color: var(--vdl-text-primary);
+}
+
+button,
+input,
+select,
+textarea {
+  font: inherit;
+}

@@ -1,0 +1,7 @@
+.git
+target
+dist
+frontend/node_modules
+*.db
+*.db-shm
+*.db-wal

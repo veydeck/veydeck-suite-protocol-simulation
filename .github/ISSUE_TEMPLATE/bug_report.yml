@@ -1,0 +1,70 @@
+name: 缺陷报告
+description: 报告协议仿真套件的可复现问题
+title: "[Bug] "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        请尽量说明问题现象。不要在 issue 中粘贴敏感目标、凭据或内网地址。
+  - type: textarea
+    id: summary
+    attributes:
+      label: 问题描述
+      description: 简要说明遇到的问题、影响和实际现象。
+      placeholder: 例如：规则包导入失败、实例部署失败、PCAP 取证异常或审计日志缺失。
+    validations:
+      required: true
+  - type: dropdown
+    id: scope
+    attributes:
+      label: 影响范围
+      multiple: true
+      options:
+        - 规则包导入
+        - 规则管理
+        - 实例部署
+        - 协议引擎
+        - PCAP 取证
+        - 审计日志
+        - 套件前端
+        - Agent 集成
+        - 镜像构建/发布
+        - 配置/部署
+        - 文档
+        - 其他
+    validations:
+      required: false
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: 复现方式
+      description: 如能复现，请写出步骤；不能稳定复现也可以留空。
+      placeholder: |
+        1. ...
+        2. ...
+        3. ...
+    validations:
+      required: false
+  - type: textarea
+    id: environment
+    attributes:
+      label: 环境信息
+      description: 如相关，请填写版本、操作系统、架构、Docker/运行方式等。
+      placeholder: |
+        Veydeck 版本：
+        套件版本/提交：
+        操作系统：
+        架构：
+        运行方式：
+    validations:
+      required: false
+  - type: textarea
+    id: logs
+    attributes:
+      label: 日志或截图
+      description: 粘贴相关日志，注意脱敏。
+      render: shell
+    validations:
+      required: false

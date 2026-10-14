@@ -1,0 +1,24 @@
+FROM rust:1.95.0-trixie AS rust-builder
+
+WORKDIR /src
+
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+
+RUN cargo build --release -p protocol-simulation-engine
+
+FROM debian:trixie-slim
+
+LABEL veydeck.owner="suite"
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=rust-builder /src/target/release/protocol-simulation-engine /usr/local/bin/protocol-simulation-engine
+
+ENV VEYDECK_SIM_PORT=8081
+
+EXPOSE 8081
+
+CMD ["protocol-simulation-engine"]

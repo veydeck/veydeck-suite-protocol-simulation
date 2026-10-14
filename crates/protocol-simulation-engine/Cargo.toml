@@ -1,0 +1,20 @@
+[package]
+name = "protocol-simulation-engine"
+version = "0.1.0-alpha.1"
+edition.workspace = true
+
+[dependencies]
+protocol-simulation-common = { path = "../protocol-simulation-common" }
+
+anyhow.workspace = true
+axum.workspace = true
+chrono.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+base64 = "0.22"
+sha1.workspace = true

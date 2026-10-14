@@ -1,0 +1,41 @@
+name: 功能需求
+description: 提出协议仿真套件的新能力或行为改进
+title: "[Feature] "
+labels:
+  - enhancement
+body:
+  - type: textarea
+    id: summary
+    attributes:
+      label: 需求描述
+      description: 描述希望新增或改进什么，以及它解决什么问题。
+      placeholder: 例如：需要支持新的协议类型、规则能力、取证能力或套件集成能力。
+    validations:
+      required: true
+  - type: dropdown
+    id: scope
+    attributes:
+      label: 影响模块
+      multiple: true
+      options:
+        - 协议支持
+        - 规则包/规则模型
+        - 实例生命周期
+        - 协议引擎
+        - PCAP 取证
+        - 审计日志
+        - 套件前端
+        - Agent 集成
+        - 镜像构建/发布
+        - 配置/部署
+        - 文档
+        - 其他
+    validations:
+      required: false
+  - type: textarea
+    id: notes
+    attributes:
+      label: 补充说明
+      description: 记录示例、参考链接、备选方案或验收标准。
+    validations:
+      required: false
