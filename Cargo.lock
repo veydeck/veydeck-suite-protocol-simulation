@@ -1318,7 +1318,7 @@ dependencies = [
 
 [[package]]
 name = "protocol-simulation"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "anyhow",
  "axum",
@@ -1355,7 +1355,7 @@ dependencies = [
 
 [[package]]
 name = "protocol-simulation-engine"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "anyhow",
  "axum",

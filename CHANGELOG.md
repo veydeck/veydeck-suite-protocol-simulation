@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.1.0-alpha.2] - 2026-11-02
+
 ### Changed
 
 - 明确协议身份配置契约，移除 Redis banner、RDP 无效参数、SMB shares 与 LDAP 目录/凭据配置，不保留 alpha 历史配置兼容。
