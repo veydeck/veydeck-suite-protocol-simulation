@@ -190,7 +190,7 @@ pub fn protocol_descriptor(protocol: ProtocolId) -> ProtocolDescriptor {
     let fields = match protocol {
         ProtocolId::Http => vec![field("server_header", "serverHeader", "text", false, false)],
         ProtocolId::Redis => vec![
-            field("banner", "banner", "text", false, false),
+            field("server_version", "serverVersion", "text", false, false),
             field("require_auth", "requireAuth", "boolean", false, false),
             field("password", "password", "text", false, true),
             field("keys", "keys", "key_value", false, false),
@@ -204,10 +204,7 @@ pub fn protocol_descriptor(protocol: ProtocolId) -> ProtocolDescriptor {
             field("banner", "banner", "text", false, false),
             field("credentials", "credentials", "credentials", false, true),
         ],
-        ProtocolId::Rdp => vec![
-            field("flags", "rdpFlags", "number", false, false),
-            field("credentials", "credentials", "credentials", false, true),
-        ],
+        ProtocolId::Rdp => vec![],
         ProtocolId::Mysql | ProtocolId::Postgresql => vec![
             field("server_version", "serverVersion", "text", false, false),
             field("credentials", "credentials", "credentials", false, true),
@@ -216,16 +213,18 @@ pub fn protocol_descriptor(protocol: ProtocolId) -> ProtocolDescriptor {
         ProtocolId::Smb => vec![
             field("server_name", "serverName", "text", false, false),
             field("domain", "domain", "text", false, false),
-            field("shares", "shares", "string_list", false, false),
         ],
         ProtocolId::Ldap => vec![
             field("base_dn", "baseDn", "text", true, false),
-            field("credentials", "credentials", "credentials", false, true),
+            field("vendor_name", "vendorName", "text", false, false),
+            field("vendor_version", "vendorVersion", "text", false, false),
         ],
         ProtocolId::Dns => vec![
             field("records", "dnsRecords", "key_value", true, false),
             field("default_ipv4", "defaultIpv4", "text", false, false),
             field("ttl", "ttl", "number", false, false),
+            field("server_version", "serverVersion", "text", false, false),
+            field("server_name", "serverName", "text", false, false),
         ],
         ProtocolId::Mongodb => vec![
             field("server_version", "serverVersion", "text", false, false),
@@ -430,10 +429,10 @@ pub struct RedisCommandResponse {
     pub event_type: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub struct SimRedisConfig {
-    pub banner: Option<String>,
+    pub server_version: Option<String>,
     pub require_auth: Option<bool>,
     pub password: Option<String>,
     pub server_info: Option<BTreeMap<String, String>>,
@@ -524,11 +523,8 @@ pub struct SimFtpConfig {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub struct SimRdpConfig {
-    pub flags: Option<u32>,
-    pub credentials: Option<Vec<Credential>>,
-}
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub struct SimRdpConfig {}
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -549,24 +545,25 @@ pub struct SimDatabaseConfig {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub struct SimSmbConfig {
     pub server_name: Option<String>,
     pub domain: Option<String>,
-    pub shares: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub struct SimLdapConfig {
     pub base_dn: String,
-    pub credentials: Option<Vec<Credential>>,
-    pub entries: Option<Vec<BTreeMap<String, Value>>>,
+    pub vendor_name: Option<String>,
+    pub vendor_version: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub struct SimDnsConfig {
+    pub server_version: Option<String>,
+    pub server_name: Option<String>,
     pub records: BTreeMap<String, String>,
     pub default_ipv4: Option<String>,
     pub ttl: Option<u32>,
@@ -611,6 +608,81 @@ pub struct SimVncConfig {
 }
 
 pub fn validate_behavior(protocol: ProtocolId, value: Value) -> Result<Value, serde_json::Error> {
+    use serde::de::Error;
+    let invalid = |message: &str| serde_json::Error::custom(message);
+    if let Some(banner) = value.get("banner").and_then(Value::as_str) {
+        if banner.contains(['\r', '\n', '\0']) {
+            return Err(invalid(
+                "banner must be a single line without control terminators",
+            ));
+        }
+        let prefix = match protocol {
+            ProtocolId::Smtp | ProtocolId::Ftp => "220",
+            ProtocolId::Pop3 => "+OK",
+            ProtocolId::Imap => "* OK",
+            _ => "",
+        };
+        if !prefix.is_empty() && banner.to_ascii_uppercase().starts_with(prefix) {
+            return Err(invalid(
+                "banner must contain greeting text without the protocol status prefix",
+            ));
+        }
+        if protocol == ProtocolId::Ssh && (!banner.starts_with("SSH-2.0-") || banner.len() > 253) {
+            return Err(invalid(
+                "SSH banner must be a valid SSH-2.0 identification line",
+            ));
+        }
+    }
+    if let Some(version) = value.get("server_version").and_then(Value::as_str)
+        && (version.is_empty() || version.contains(['\r', '\n', '\0']))
+    {
+        return Err(invalid("server_version must be a non-empty single line"));
+    }
+    for key in [
+        "server_name",
+        "domain",
+        "vendor_name",
+        "vendor_version",
+        "hostname",
+        "server_header",
+    ] {
+        if let Some(text) = value.get(key).and_then(Value::as_str)
+            && (text.is_empty() || text.len() > 255 || text.chars().any(char::is_control))
+        {
+            return Err(invalid(
+                "service identity must be a non-empty single line of at most 255 bytes",
+            ));
+        }
+    }
+    for key in ["server_info", "stats", "oids"] {
+        if let Some(fields) = value.get(key).and_then(Value::as_object) {
+            for (name, text) in fields {
+                if name.is_empty()
+                    || name
+                        .chars()
+                        .any(|ch| ch.is_whitespace() || ch == ':' || ch.is_control())
+                    || text
+                        .as_str()
+                        .is_some_and(|v| v.chars().any(char::is_control))
+                {
+                    return Err(invalid(
+                        "identity map contains invalid field names or control characters",
+                    ));
+                }
+            }
+        }
+    }
+    if protocol == ProtocolId::Dns {
+        for key in ["server_version", "server_name"] {
+            if value
+                .get(key)
+                .and_then(Value::as_str)
+                .is_some_and(|v| v.len() > 255)
+            {
+                return Err(invalid("DNS identity TXT value exceeds 255 bytes"));
+            }
+        }
+    }
     match protocol {
         ProtocolId::Http => round_trip::<SimHttpConfig>(value),
         ProtocolId::Redis => round_trip::<SimRedisConfig>(value),
@@ -709,5 +781,55 @@ mod tests {
         assert_eq!(descriptor.endpoints[0].transport.as_str(), "udp");
         assert_eq!(descriptor.endpoints[0].container_port, 161);
         assert_eq!(descriptor.endpoints[0].default_host_port, 161);
+    }
+    #[test]
+    fn greeting_configuration_is_body_only_and_single_line() {
+        use serde_json::json;
+        for (protocol, prefix) in [
+            (ProtocolId::Smtp, "220 mail"),
+            (ProtocolId::Pop3, "+OK ready"),
+            (ProtocolId::Imap, "* OK ready"),
+            (ProtocolId::Ftp, "220 ready"),
+        ] {
+            assert!(validate_behavior(protocol, json!({"banner": prefix})).is_err());
+            assert!(validate_behavior(protocol, json!({"banner": "ready"})).is_ok());
+            assert!(validate_behavior(protocol, json!({"banner": "ready\r\nforged"})).is_err());
+        }
+        assert!(
+            validate_behavior(ProtocolId::Ssh, json!({"banner":"SSH-2.0-OpenSSH_9.6"})).is_ok()
+        );
+        assert!(validate_behavior(ProtocolId::Ssh, json!({"banner":"OpenSSH_9.6"})).is_err());
+    }
+    #[test]
+    fn removed_fields_are_rejected_and_identity_fields_round_trip() {
+        use serde_json::json;
+        for (protocol, value) in [
+            (ProtocolId::Redis, json!({"banner":"ready"})),
+            (ProtocolId::Rdp, json!({"flags":1})),
+            (ProtocolId::Smb, json!({"shares":[]})),
+            (ProtocolId::Ldap, json!({"base_dn":"dc=test", "entries":[]})),
+        ] {
+            assert!(validate_behavior(protocol, value).is_err());
+        }
+        let ldap = validate_behavior(
+            ProtocolId::Ldap,
+            json!({"base_dn":"dc=test", "vendor_name":"OpenLDAP", "vendor_version":"2.6.8"}),
+        )
+        .unwrap();
+        assert_eq!(ldap["vendor_version"], "2.6.8");
+        assert!(
+            validate_behavior(
+                ProtocolId::Dns,
+                json!({"records":{}, "server_version":"x".repeat(256)})
+            )
+            .is_err()
+        );
+        assert!(
+            validate_behavior(
+                ProtocolId::Redis,
+                json!({"server_info":{"redis_version":"1\r\nforged"}})
+            )
+            .is_err()
+        );
     }
 }

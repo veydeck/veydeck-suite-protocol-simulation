@@ -23,6 +23,10 @@ async fn read_packet(stream: &mut TcpStream) -> anyhow::Result<Option<(u8, Vec<u
         Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
         Err(error) => return Err(error.into()),
     };
+    anyhow::ensure!(
+        matches!(first, 0x10 | 0xc0 | 0xe0),
+        "unsupported MQTT control packet or flags"
+    );
     let mut multiplier = 1_usize;
     let mut remaining = 0_usize;
     for index in 0..4 {
@@ -45,19 +49,75 @@ async fn read_packet(stream: &mut TcpStream) -> anyhow::Result<Option<(u8, Vec<u
 }
 
 fn parse_connect(payload: &[u8]) -> anyhow::Result<(u8, bool)> {
-    if payload.len() < 7 {
-        anyhow::bail!("MQTT CONNECT packet is truncated");
+    fn field<'a>(payload: &'a [u8], offset: &mut usize) -> anyhow::Result<&'a [u8]> {
+        let bytes = payload
+            .get(*offset..*offset + 2)
+            .context("truncated MQTT string length")?;
+        let length = usize::from(u16::from_be_bytes(bytes.try_into()?));
+        *offset += 2;
+        let value = payload
+            .get(*offset..*offset + length)
+            .context("truncated MQTT string")?;
+        *offset += length;
+        Ok(value)
     }
-    let name_len = usize::from(u16::from_be_bytes([payload[0], payload[1]]));
-    if 2 + name_len + 2 > payload.len() {
-        anyhow::bail!("MQTT protocol name is truncated");
+    fn properties(payload: &[u8], offset: &mut usize) -> anyhow::Result<()> {
+        let mut length = 0;
+        for index in 0..4 {
+            let byte = *payload.get(*offset).context("truncated MQTT properties")?;
+            *offset += 1;
+            length |= usize::from(byte & 0x7f) << (index * 7);
+            if byte & 0x80 == 0 {
+                *offset += length;
+                anyhow::ensure!(*offset <= payload.len(), "truncated MQTT properties");
+                return Ok(());
+            }
+        }
+        anyhow::bail!("invalid MQTT properties length")
     }
-    let name = &payload[2..2 + name_len];
-    if name != b"MQTT" && name != b"MQIsdp" {
-        anyhow::bail!("MQTT CONNECT contains an unsupported protocol name");
+    let mut offset = 0;
+    let name = field(payload, &mut offset)?;
+    let header = payload
+        .get(offset..offset + 4)
+        .context("truncated MQTT CONNECT header")?;
+    let level = header[0];
+    let flags = header[1];
+    offset += 4;
+    anyhow::ensure!(
+        (name == b"MQTT" && matches!(level, 4 | 5)) || (name == b"MQIsdp" && level == 3),
+        "unsupported MQTT protocol name/version"
+    );
+    anyhow::ensure!(
+        flags & 1 == 0 && (flags >> 3) & 3 != 3,
+        "invalid MQTT CONNECT flags"
+    );
+    anyhow::ensure!(
+        flags & 4 != 0 || flags & 0x38 == 0,
+        "will flags without a will"
+    );
+    anyhow::ensure!(
+        flags & 0x40 == 0 || flags & 0x80 != 0,
+        "MQTT password without username"
+    );
+    if level == 5 {
+        properties(payload, &mut offset)?;
     }
-    let level = payload[2 + name_len];
-    let flags = payload[3 + name_len];
+    let client_id = field(payload, &mut offset)?;
+    std::str::from_utf8(client_id)?;
+    if flags & 4 != 0 {
+        if level == 5 {
+            properties(payload, &mut offset)?;
+        }
+        std::str::from_utf8(field(payload, &mut offset)?)?;
+        field(payload, &mut offset)?;
+    }
+    if flags & 0x80 != 0 {
+        std::str::from_utf8(field(payload, &mut offset)?)?;
+    }
+    if flags & 0x40 != 0 {
+        field(payload, &mut offset)?;
+    }
+    anyhow::ensure!(offset == payload.len(), "trailing MQTT CONNECT payload");
     Ok((level, flags & 0xc0 != 0))
 }
 
@@ -65,18 +125,33 @@ fn connack(level: u8, accepted: bool) -> Vec<u8> {
     if level == 5 {
         vec![0x20, 0x03, 0x00, if accepted { 0x00 } else { 0x87 }, 0x00]
     } else {
-        vec![0x20, 0x02, 0x00, if accepted { 0x00 } else { 0x05 }]
+        vec![
+            0x20,
+            0x02,
+            0x00,
+            if accepted {
+                0x00
+            } else if level == 4 {
+                0x05
+            } else {
+                0x01
+            },
+        ]
     }
 }
 
 async fn handle(ctx: Arc<Context>, mut stream: TcpStream, peer: SocketAddr) -> anyhow::Result<()> {
+    let mut connected = false;
     while let Some((header, payload)) = read_packet(&mut stream).await? {
         let packet_type = header >> 4;
         match packet_type {
             1 => {
-                let (level, has_credentials) = parse_connect(&payload)?;
-                let accepted = matches!(level, 4 | 5)
-                    && (ctx.config.allow_anonymous.unwrap_or(true) || has_credentials);
+                anyhow::ensure!(!connected, "duplicate MQTT CONNECT");
+                let (level, _) = parse_connect(&payload)?;
+                // No credential database is simulated: supplying arbitrary credentials
+                // must not bypass allow_anonymous=false.
+                let accepted = matches!(level, 4 | 5) && ctx.config.allow_anonymous.unwrap_or(true);
+                connected = accepted;
                 stream.write_all(&connack(level, accepted)).await?;
                 report_sim_log_async(
                     ctx.callback_url.clone(),
@@ -99,6 +174,7 @@ async fn handle(ctx: Arc<Context>, mut stream: TcpStream, peer: SocketAddr) -> a
                 }
             }
             12 => {
+                anyhow::ensure!(connected, "MQTT CONNECT required before PINGREQ");
                 if !payload.is_empty() {
                     anyhow::bail!("MQTT PINGREQ must not contain a payload");
                 }
@@ -184,5 +260,23 @@ mod tests {
     #[test]
     fn mqtt_five_connack_contains_empty_properties() {
         assert_eq!(connack(5, true), [0x20, 0x03, 0x00, 0x00, 0x00]);
+    }
+    #[test]
+    fn connect_rejects_truncation_invalid_flags_and_trailing_data() {
+        let valid = b"\0\x04MQTT\x04\x02\0\x1e\0\x04nmap";
+        for length in 0..valid.len() {
+            assert!(parse_connect(&valid[..length]).is_err());
+        }
+        let mut invalid = valid.to_vec();
+        invalid[7] = 1;
+        assert!(parse_connect(&invalid).is_err());
+        let mut invalid = valid.to_vec();
+        invalid.push(0);
+        assert!(parse_connect(&invalid).is_err());
+        assert_eq!(
+            parse_connect(b"\0\x04MQTT\x05\x02\0\x1e\0\0\x04nmap").unwrap(),
+            (5, false)
+        );
+        assert_eq!(connack(3, false), [0x20, 0x02, 0x00, 0x01]);
     }
 }

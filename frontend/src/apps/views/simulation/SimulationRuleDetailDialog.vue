@@ -44,9 +44,7 @@ const isMailRule = computed(() =>
   ["smtp", "pop3", "imap"].includes(protocol.value),
 );
 const isCredsRule = computed(() =>
-  ["ssh", "ftp", "rdp", "telnet", "mysql", "postgresql", "ldap"].includes(
-    protocol.value,
-  ),
+  ["ssh", "ftp", "telnet", "mysql", "postgresql"].includes(protocol.value),
 );
 
 const fieldLabel = (field: SimulationFieldCapability) =>

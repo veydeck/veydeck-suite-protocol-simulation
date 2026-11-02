@@ -21,6 +21,7 @@ mod snmp;
 mod ssh;
 mod telnet;
 mod vnc;
+mod wire;
 
 pub use database::{start_mysql_simulation, start_postgresql_simulation};
 pub use dns::{start_dns_tcp_simulation, start_dns_udp_simulation};

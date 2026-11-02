@@ -4,19 +4,14 @@ use super::common::{SimLogDraft, report_sim_log_async};
 pub use super::config::{MailCredential, MailCustomResponse, MailMessage};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 
 /// 按 CRLF 行协议读取一行输入。
 pub(super) async fn read_line(
     reader: &mut BufReader<OwnedReadHalf>,
 ) -> anyhow::Result<Option<String>> {
-    let mut line = String::new();
-    let bytes = reader.read_line(&mut line).await?;
-    if bytes == 0 {
-        return Ok(None);
-    }
-    Ok(Some(line.trim_end_matches(['\r', '\n']).to_string()))
+    super::wire::read_line(reader).await
 }
 
 /// 写入一行 CRLF 响应。

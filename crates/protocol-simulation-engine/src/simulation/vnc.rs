@@ -76,7 +76,14 @@ async fn handle(ctx: Arc<Context>, mut stream: TcpStream, peer: SocketAddr) -> a
         anyhow::bail!("invalid VNC client protocol version");
     }
 
-    let selected = if ctx.protocol_version == "3.3" {
+    let client_version = match &client_banner {
+        b"RFB 003.003\n" => "3.3",
+        b"RFB 003.007\n" => "3.7",
+        b"RFB 003.008\n" => "3.8",
+        _ => anyhow::bail!("unsupported VNC client protocol version"),
+    };
+    let version = std::cmp::min(ctx.protocol_version.as_str(), client_version);
+    let selected = if version == "3.3" {
         stream
             .write_all(&u32::from(ctx.security_types[0]).to_be_bytes())
             .await?;
@@ -94,16 +101,16 @@ async fn handle(ctx: Arc<Context>, mut stream: TcpStream, peer: SocketAddr) -> a
     };
     match selected {
         1 => {
-            if ctx.protocol_version != "3.3" {
+            if version == "3.8" {
                 stream.write_all(&0_u32.to_be_bytes()).await?;
             }
         }
         2 => {
-            stream.write_all(b"VeydeckVNCProbe!").await?;
+            stream.write_all(uuid::Uuid::now_v7().as_bytes()).await?;
             let mut response = [0_u8; 16];
             stream.read_exact(&mut response).await?;
             stream.write_all(&1_u32.to_be_bytes()).await?;
-            if ctx.protocol_version == "3.8" {
+            if version == "3.8" {
                 let reason = b"Authentication unavailable in protocol simulation";
                 stream
                     .write_all(&u32::try_from(reason.len())?.to_be_bytes())

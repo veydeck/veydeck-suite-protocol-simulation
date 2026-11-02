@@ -39,21 +39,24 @@ async fn read_packet<Stream>(stream: &mut Stream) -> anyhow::Result<Option<(u8, 
 where
     Stream: AsyncRead + Unpin,
 {
-    let first = match stream.read_u8().await {
-        Ok(value) => value,
-        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(error) => return Err(error.into()),
-    };
-    let second = stream.read_u8().await?;
-    let third = stream.read_u8().await?;
-    let length = usize::from(first) | (usize::from(second) << 8) | (usize::from(third) << 16);
-    if length > MAX_PACKET_SIZE {
-        bail!("MySQL packet exceeds simulation limit: {length}");
-    }
-    let sequence = stream.read_u8().await?;
-    let mut payload = vec![0; length];
-    stream.read_exact(&mut payload).await?;
-    Ok(Some((sequence, payload)))
+    tokio::time::timeout(crate::simulation::wire::IDLE_TIMEOUT, async {
+        let first = match stream.read_u8().await {
+            Ok(value) => value,
+            Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        let second = stream.read_u8().await?;
+        let third = stream.read_u8().await?;
+        let length = usize::from(first) | (usize::from(second) << 8) | (usize::from(third) << 16);
+        if length > MAX_PACKET_SIZE {
+            bail!("MySQL packet exceeds simulation limit: {length}");
+        }
+        let sequence = stream.read_u8().await?;
+        let mut payload = vec![0; length];
+        stream.read_exact(&mut payload).await?;
+        Ok(Some((sequence, payload)))
+    })
+    .await?
 }
 
 fn handshake(version: &str) -> Vec<u8> {

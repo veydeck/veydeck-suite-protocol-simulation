@@ -108,7 +108,7 @@ async fn handle_tcp_connection(
     runtime: DnsRuntime,
 ) -> anyhow::Result<()> {
     loop {
-        let size = match stream.read_u16().await {
+        let size = match tokio::time::timeout(super::wire::IDLE_TIMEOUT, stream.read_u16()).await? {
             Ok(size) => usize::from(size),
             Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
             Err(error) => return Err(error).context("failed to read DNS TCP message length"),
@@ -117,9 +117,8 @@ async fn handle_tcp_connection(
             anyhow::bail!("invalid DNS TCP message length: {size}");
         }
         let mut query = vec![0_u8; size];
-        stream
-            .read_exact(&mut query)
-            .await
+        tokio::time::timeout(super::wire::IDLE_TIMEOUT, stream.read_exact(&mut query))
+            .await?
             .context("failed to read DNS TCP query")?;
         let (response, name) = build_response(&query, &runtime.config)?;
         stream.write_u16(u16::try_from(response.len())?).await?;
@@ -138,7 +137,7 @@ fn report_query(runtime: &DnsRuntime, peer: SocketAddr, payload: &[u8], name: &s
             client_port: peer.port(),
             server_port: runtime.server_port,
             event_type: "query".to_string(),
-            detail_summary: format!("DNS {} A query for {name}", runtime.transport),
+            detail_summary: format!("DNS {} query for {name}", runtime.transport),
             payload_hex: Some(encode_hex(payload)),
         },
         runtime.endpoint_id.clone(),
@@ -146,6 +145,12 @@ fn report_query(runtime: &DnsRuntime, peer: SocketAddr, payload: &[u8], name: &s
 }
 
 fn validate_config(config: &SimDnsConfig) -> anyhow::Result<()> {
+    for value in [&config.server_version, &config.server_name]
+        .into_iter()
+        .flatten()
+    {
+        anyhow::ensure!(value.len() <= 255, "DNS identity exceeds one TXT string");
+    }
     for (name, address) in &config.records {
         if name.trim().is_empty() {
             anyhow::bail!("DNS record name cannot be empty");
@@ -189,27 +194,52 @@ fn build_response(query: &[u8], config: &SimDnsConfig) -> anyhow::Result<(Vec<u8
         .map(|(_, address)| address)
         .or(config.default_ipv4.as_ref())
         .and_then(|address| address.parse::<Ipv4Addr>().ok());
-    let has_answer = query_type == 1 && query_class == 1 && address.is_some();
-
-    let mut response = Vec::with_capacity(question_end + 16);
-    response.extend_from_slice(&query[0..2]);
-    response.extend_from_slice(if address.is_some() {
-        &[0x81, 0x80]
+    let txt = if query_class == 3 && query_type == 16 {
+        match normalized.as_str() {
+            "version.bind" => Some(config.server_version.as_deref().unwrap_or("9.18.30")),
+            "id.server" => Some(config.server_name.as_deref().unwrap_or("dns.veydeck.local")),
+            _ => None,
+        }
     } else {
-        &[0x81, 0x83]
-    });
+        None
+    };
+    let mut data = Vec::new();
+    if let Some(txt) = txt {
+        anyhow::ensure!(txt.len() <= 255, "DNS identity exceeds one TXT string");
+        data.push(txt.len() as u8);
+        data.extend_from_slice(txt.as_bytes());
+    } else if query_class == 1
+        && query_type == 1
+        && let Some(address) = address
+    {
+        data.extend_from_slice(&address.octets());
+    }
+    let has_answer = !data.is_empty();
+    let known_name = if query_class == 3 {
+        matches!(normalized.as_str(), "version.bind" | "id.server")
+    } else {
+        address.is_some()
+    };
+    let mut response = Vec::with_capacity(question_end + 16 + data.len());
+    response.extend_from_slice(&query[0..2]);
+    let request_flags = u16::from_be_bytes([query[2], query[3]]);
+    anyhow::ensure!(
+        request_flags & 0xf800 == 0,
+        "DNS request must be a standard query"
+    );
+    let flags: u16 = 0x8400 | (request_flags & 0x0100) | if known_name { 0 } else { 3 };
+    response.extend_from_slice(&flags.to_be_bytes());
     response.extend_from_slice(&1_u16.to_be_bytes());
     response.extend_from_slice(&(u16::from(has_answer)).to_be_bytes());
-    response.extend_from_slice(&0_u16.to_be_bytes());
-    response.extend_from_slice(&0_u16.to_be_bytes());
+    response.extend_from_slice(&[0, 0, 0, 0]);
     response.extend_from_slice(&query[12..question_end]);
-    if let Some(address) = address.filter(|_| has_answer) {
+    if has_answer {
         response.extend_from_slice(&[0xc0, 0x0c]);
-        response.extend_from_slice(&1_u16.to_be_bytes());
-        response.extend_from_slice(&1_u16.to_be_bytes());
+        response.extend_from_slice(&query_type.to_be_bytes());
+        response.extend_from_slice(&query_class.to_be_bytes());
         response.extend_from_slice(&config.ttl.unwrap_or(60).to_be_bytes());
-        response.extend_from_slice(&4_u16.to_be_bytes());
-        response.extend_from_slice(&address.octets());
+        response.extend_from_slice(&(data.len() as u16).to_be_bytes());
+        response.extend_from_slice(&data);
     }
     Ok((response, normalized))
 }
@@ -252,10 +282,35 @@ mod tests {
             records: BTreeMap::from([("dns.veydeck.local".to_string(), "192.0.2.53".to_string())]),
             default_ipv4: None,
             ttl: Some(120),
+            ..Default::default()
         };
         let (response, name) = build_response(&query("dns.veydeck.local"), &config).unwrap();
         assert_eq!(name, "dns.veydeck.local");
         assert_eq!(&response[6..8], &[0, 1]);
         assert_eq!(&response[response.len() - 4..], &[192, 0, 2, 53]);
+    }
+    #[test]
+    fn chaos_txt_returns_version_and_identity() {
+        let config = SimDnsConfig {
+            server_version: Some("BIND-test".into()),
+            server_name: Some("ns.test".into()),
+            ..Default::default()
+        };
+        for (name, expected) in [("version.bind", "BIND-test"), ("id.server", "ns.test")] {
+            let mut query = query(name);
+            let end = query.len();
+            query[end - 4..].copy_from_slice(&[0, 16, 0, 3]);
+            let (output, _) = build_response(&query, &config).unwrap();
+            assert_eq!(&output[6..8], &[0, 1]);
+            assert!(output.ends_with(expected.as_bytes()));
+        }
+    }
+    #[test]
+    fn unsupported_type_has_no_fake_a_answer() {
+        let mut query = query("version.bind");
+        let end = query.len();
+        query[end - 4..].copy_from_slice(&[0, 28, 0, 3]);
+        let (output, _) = build_response(&query, &SimDnsConfig::default()).unwrap();
+        assert_eq!(&output[6..8], &[0, 0]);
     }
 }

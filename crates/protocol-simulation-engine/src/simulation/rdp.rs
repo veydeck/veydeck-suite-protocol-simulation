@@ -19,8 +19,6 @@ struct RdpSimulationContext {
     node_id: String,
     callback_url: String,
     port: u16,
-    #[allow(dead_code)]
-    config: SimRdpConfig,
 }
 
 // --- X.224 / TPKT 协议常量 ---
@@ -56,26 +54,23 @@ fn parse_connection_request(data: &[u8]) -> (Option<String>, Option<u32>) {
         return (None, None);
     }
 
-    // 提取 X.224 负载起始位置（跳过 TPKT 4 字节 + X.224 头部 7 字节）
     let payload = &data[11..];
-
-    // 尝试从 cookie 中提取用户名
-    // Cookie 格式：'Cookie: mstshash=<username>\r\n'
-    let cookie = if let Ok(text) = std::str::from_utf8(payload) {
-        text.lines()
-            .find(|line| line.starts_with("Cookie: mstshash="))
-            .and_then(|line| line.strip_prefix("Cookie: mstshash="))
-            .map(|s| s.trim().to_string())
+    let cookie_end = payload.windows(2).position(|v| v == b"\r\n").map(|p| p + 2);
+    let cookie = cookie_end
+        .and_then(|end| std::str::from_utf8(&payload[..end]).ok())
+        .and_then(|line| line.strip_prefix("Cookie: mstshash="))
+        .map(|value| value.trim().to_string());
+    let negotiation = if cookie.is_some() {
+        &payload[cookie_end.unwrap()..]
     } else {
-        None
+        payload
     };
-
-    // 尝试提取请求的协议类型
-    // RDP Negotiation Request 结构：type(1=0x01) + flags(1) + length(2=8) + requestedProtocols(4)
-    let requested_protocols = payload
-        .windows(8)
-        .find(|window| window[0] == 0x01 && window[2] == 0x08 && window[3] == 0x00)
-        .map(|window| u32::from_le_bytes([window[4], window[5], window[6], window[7]]));
+    let requested_protocols =
+        if negotiation.len() == 8 && negotiation[0] == 1 && negotiation[2..4] == [8, 0] {
+            Some(u32::from_le_bytes(negotiation[4..8].try_into().unwrap()))
+        } else {
+            None
+        };
 
     (cookie, requested_protocols)
 }
@@ -111,6 +106,19 @@ fn build_connection_confirm(selected_protocol: u32) -> Vec<u8> {
     response.extend_from_slice(&selected_protocol.to_le_bytes());
 
     response
+}
+
+fn negotiation_response(requested: Option<u32>) -> Vec<u8> {
+    match requested {
+        Some(0) => build_connection_confirm(0),
+        Some(_) => {
+            // SSL_NOT_ALLOWED_BY_SERVER: do not select an unrequested TLS/NLA mode.
+            let mut response = build_connection_confirm(2);
+            response[11] = 3;
+            response
+        }
+        None => vec![3, 0, 0, 11, 6, 0xd0, 0, 0, 0, 0, 0],
+    }
 }
 
 /// 将请求协议位掩码转换为可读的协议名称。
@@ -158,17 +166,25 @@ async fn handle_rdp_connection(
         },
     );
 
-    // 读取客户端 X.224 Connection Request
-    let mut buffer = vec![0u8; 4096];
-    let read_len =
-        match tokio::time::timeout(std::time::Duration::from_secs(10), stream.read(&mut buffer))
-            .await
-        {
-            Ok(Ok(n)) if n > 0 => n,
-            _ => return Ok(()),
-        };
-
-    let request_data = &buffer[..read_len];
+    // A TCP read is not a TPKT message: read and validate the declared frame.
+    let request = tokio::time::timeout(super::wire::IDLE_TIMEOUT, async {
+        let mut header = [0; 4];
+        stream.read_exact(&mut header).await?;
+        anyhow::ensure!(header[..2] == [3, 0], "invalid TPKT header");
+        let length = usize::from(u16::from_be_bytes([header[2], header[3]]));
+        anyhow::ensure!((11..=4096).contains(&length), "invalid TPKT length");
+        let mut packet = header.to_vec();
+        packet.resize(length, 0);
+        stream.read_exact(&mut packet[4..]).await?;
+        anyhow::ensure!(
+            packet[5] == 0xe0 && usize::from(packet[4]) + 5 == length,
+            "invalid X.224 request"
+        );
+        Ok::<_, anyhow::Error>(packet)
+    })
+    .await??;
+    let request_data = &request;
+    let mut buffer = vec![0; 4096];
     let (cookie, requested_protocols) = parse_connection_request(request_data);
 
     // 构建审计日志摘要
@@ -201,8 +217,12 @@ async fn handle_rdp_connection(
 
     // 发送 X.224 Connection Confirm 响应
     // 选择 Standard RDP Security (0x00) 以避免 TLS/NLA 协商失败
-    let confirm = build_connection_confirm(0x00);
+    let confirm = negotiation_response(requested_protocols);
     stream.write_all(&confirm).await?;
+    // Discovery ends at negotiation; no MCS or security session is advertised.
+    if requested_protocols.is_some_and(|flags| flags != 0) {
+        return Ok(());
+    }
 
     // 继续读取后续数据（MCS Connect Initial 等），仅记录不做深层解析
     loop {
@@ -245,7 +265,7 @@ pub async fn start_rdp_simulation(
     port: u16,
     callback_url: String,
     node_id: String,
-    config: SimRdpConfig,
+    _config: SimRdpConfig,
     listener: tokio::net::TcpListener,
     mut shutdown_rx: oneshot::Receiver<()>,
 ) -> anyhow::Result<()> {
@@ -254,7 +274,6 @@ pub async fn start_rdp_simulation(
         node_id,
         callback_url,
         port,
-        config,
     });
 
     let name_str = rule_name.unwrap_or_else(|| "Unknown Rule".to_string());
@@ -285,4 +304,29 @@ pub async fn start_rdp_simulation(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn negotiation_does_not_claim_tls_or_nla() {
+        assert_eq!(negotiation_response(None).len(), 11);
+        let standard = negotiation_response(Some(0));
+        assert_eq!(standard[11], 2);
+        assert_eq!(&standard[15..19], &[0; 4]);
+        let tls = negotiation_response(Some(3));
+        assert_eq!(tls[11], 3);
+        assert_eq!(&tls[15..19], &2_u32.to_le_bytes());
+    }
+    #[test]
+    fn cookie_and_binary_negotiation_are_parsed_separately() {
+        let mut data = vec![3, 0, 0, 0, 0, 0xe0, 0, 0, 0, 0, 0];
+        data.extend_from_slice(b"Cookie: mstshash=user\r\n");
+        data.extend_from_slice(&[1, 0, 8, 0, 3, 0, 0, 0]);
+        assert_eq!(
+            parse_connection_request(&data),
+            (Some("user".into()), Some(3))
+        );
+    }
 }

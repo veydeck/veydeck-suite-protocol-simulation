@@ -7,7 +7,7 @@ use super::common::{SimLogDraft, report_sim_log_async};
 use super::config::SimFtpConfig;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::oneshot;
 use tracing::{error, info};
@@ -46,12 +46,7 @@ const DEFAULT_FTP_BANNER: &str = "ProFTPD 1.3.5e Server ready.";
 
 /// 按 CRLF 行协议读取一行输入。
 async fn read_line(reader: &mut BufReader<OwnedReadHalf>) -> anyhow::Result<Option<String>> {
-    let mut line = String::new();
-    let bytes = reader.read_line(&mut line).await?;
-    if bytes == 0 {
-        return Ok(None);
-    }
-    Ok(Some(line.trim_end_matches(['\r', '\n']).to_string()))
+    super::wire::read_line(reader).await
 }
 
 /// 写入一行 CRLF 响应。

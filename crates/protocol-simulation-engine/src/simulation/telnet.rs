@@ -2,7 +2,7 @@ use super::common::{SimLogDraft, encode_hex, report_sim_log_async};
 use super::config::SimTelnetConfig;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::oneshot;
 
@@ -31,6 +31,57 @@ fn report(ctx: &Context, peer: SocketAddr, event_type: &str, summary: String, pa
     );
 }
 
+async fn read_telnet_line(
+    reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>,
+) -> anyhow::Result<Option<String>> {
+    tokio::time::timeout(super::wire::IDLE_TIMEOUT, async {
+        let mut value = Vec::new();
+        loop {
+            let byte = match reader.read_u8().await {
+                Ok(v) => v,
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof && value.is_empty() => {
+                    return Ok(None);
+                }
+                Err(e) => return Err(e.into()),
+            };
+            match byte {
+                255 => {
+                    let command = reader.read_u8().await?;
+                    match command {
+                        251..=254 => {
+                            reader.read_u8().await?;
+                        }
+                        250 => {
+                            let mut last = 0;
+                            let mut ended = false;
+                            for _ in 0..8192 {
+                                let next = reader.read_u8().await?;
+                                if last == 255 && next == 240 {
+                                    ended = true;
+                                    break;
+                                }
+                                last = next;
+                            }
+                            anyhow::ensure!(ended, "oversized Telnet subnegotiation");
+                        }
+                        255 => value.push(255),
+                        _ => {}
+                    }
+                }
+                b'\n' => {
+                    return Ok(Some(
+                        String::from_utf8(value)?.trim_end_matches('\r').to_string(),
+                    ));
+                }
+                0 => {}
+                value_byte => value.push(value_byte),
+            }
+            anyhow::ensure!(value.len() <= 8192, "Telnet line too long");
+        }
+    })
+    .await?
+}
+
 async fn handle(ctx: Arc<Context>, stream: TcpStream, peer: SocketAddr) -> anyhow::Result<()> {
     report(
         &ctx,
@@ -40,17 +91,18 @@ async fn handle(ctx: Arc<Context>, stream: TcpStream, peer: SocketAddr) -> anyho
         &[],
     );
     let (read, mut write) = stream.into_split();
-    let mut lines = BufReader::new(read).lines();
-    let banner = ctx
-        .config
-        .banner
-        .as_deref()
-        .unwrap_or("Ubuntu 22.04 LTS\r\n");
-    write.write_all(banner.as_bytes()).await?;
-    write.write_all(b"login: ").await?;
-    let username = lines.next_line().await?.unwrap_or_default();
+    let mut reader = BufReader::new(read);
+    let banner = ctx.config.banner.as_deref().unwrap_or("Ubuntu 22.04 LTS");
+    let greeting = [
+        &[255, 251, 1, 255, 251, 3, 255, 252, 34][..],
+        banner.as_bytes(),
+        b"\r\nlogin: ",
+    ]
+    .concat();
+    write.write_all(&greeting).await?;
+    let username = read_telnet_line(&mut reader).await?.unwrap_or_default();
     write.write_all(b"Password: ").await?;
-    let password = lines.next_line().await?.unwrap_or_default();
+    let password = read_telnet_line(&mut reader).await?.unwrap_or_default();
     let valid = ctx.config.credentials.as_ref().is_some_and(|items| {
         items
             .iter()
@@ -73,7 +125,7 @@ async fn handle(ctx: Arc<Context>, stream: TcpStream, peer: SocketAddr) -> anyho
     }
     let prompt = ctx.config.prompt.as_deref().unwrap_or("$ ");
     write.write_all(format!("\r\n{prompt}").as_bytes()).await?;
-    while let Some(line) = lines.next_line().await? {
+    while let Some(line) = read_telnet_line(&mut reader).await? {
         let command = line.trim();
         report(
             &ctx,

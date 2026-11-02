@@ -20,11 +20,6 @@ const commandResponseRows = computed(() => {
   }));
 });
 
-const directoryEntryRows = computed(() => {
-  const entries = props.config?.entries;
-  return Array.isArray(entries) ? entries : [];
-});
-
 const dnsRecordRows = computed(() => {
   const records = props.config?.records;
   if (!records || typeof records !== "object" || Array.isArray(records)) {
@@ -76,40 +71,6 @@ const probeMapRows = computed(() => {
             prop: 'response',
             label: t('app.simulation.rules.fields.response'),
             minWidth: 280,
-          },
-        ]"
-        border
-      >
-        <template #index="{ index }">{{ index + 1 }}</template>
-      </VeyTable>
-    </div>
-  </div>
-
-  <div
-    v-if="protocol === 'ldap' && directoryEntryRows.length"
-    class="section-card"
-    data-slot="directory-entry-detail"
-  >
-    <h4>{{ t("app.simulation.rules.detailSections.directoryEntries") }}</h4>
-    <div class="table-scroll-container">
-      <VeyTable
-        :data="directoryEntryRows"
-        :columns="[
-          {
-            label: t('common.index'),
-            width: 70,
-            align: 'center',
-            slot: 'index',
-          },
-          {
-            prop: 'dn',
-            label: t('app.simulation.rules.fields.dn'),
-            minWidth: 300,
-          },
-          {
-            prop: 'objectClass',
-            label: t('app.simulation.rules.fields.objectClass'),
-            minWidth: 180,
           },
         ]"
         border

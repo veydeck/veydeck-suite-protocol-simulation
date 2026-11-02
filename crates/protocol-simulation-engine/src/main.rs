@@ -20,7 +20,10 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    let config = launch_config_from_env()?;
+    let mut config = launch_config_from_env()?;
+    config.behavior =
+        protocol_simulation_common::validate_behavior(config.protocol, config.behavior)
+            .context("invalid protocol behavior")?;
     if config.schema_version != 1 {
         anyhow::bail!(
             "unsupported engine launch schemaVersion: {}",

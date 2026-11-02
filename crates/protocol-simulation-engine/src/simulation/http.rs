@@ -10,9 +10,14 @@ use axum::{
     response::{IntoResponse, Response},
     routing::any,
 };
+use hyper_util::{
+    rt::{TokioIo, TokioTimer},
+    service::TowerToHyperService,
+};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, watch};
+use tokio::task::JoinSet;
 use tracing::info;
 
 /// 全局共享的 HTTP 仿真参数，由 Axum 路由 Handler 消费。
@@ -126,7 +131,12 @@ async fn simulation_handler(
                 }
 
                 // 强制覆写 Server Banner 标头
-                if let Some(server) = &ctx.config.server_header {
+                {
+                    let server = ctx
+                        .config
+                        .server_header
+                        .as_deref()
+                        .unwrap_or("nginx/1.24.0");
                     let parsed = HeaderValue::from_str(server);
                     if let Ok(val) = parsed {
                         response
@@ -179,7 +189,12 @@ async fn simulation_handler(
     }
 
     // 强制覆写 Server Banner 标头
-    if let Some(server) = &ctx.config.server_header {
+    {
+        let server = ctx
+            .config
+            .server_header
+            .as_deref()
+            .unwrap_or("nginx/1.24.0");
         let parsed = HeaderValue::from_str(server);
         if let Ok(val) = parsed {
             response
@@ -222,22 +237,37 @@ pub async fn start_http_simulation(
         name_str, rule_id, port
     );
 
-    let name_str_shutdown = name_str.clone();
-    let rule_id_shutdown = rule_id.clone();
-
-    // 以优雅停机模式启动 Axum Serve 服务
-    axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .with_graceful_shutdown(async move {
-        let _ = shutdown_rx.await;
-        info!(
-            "Simulation HTTP server for rule '{}' (ID: {}) on port {} gracefully shutting down...",
-            name_str_shutdown, rule_id_shutdown, port
-        );
-    })
-    .await?;
+    // HTTP field names are case-insensitive, but discovery signatures often expect
+    // conventional title case. Configure the HTTP/1 encoder rather than adding
+    // duplicate headers or rewriting serialized response bytes.
+    let (stop_tx, stop_rx) = watch::channel(false);
+    let mut connections = JoinSet::new();
+    tokio::pin!(shutdown_rx);
+    loop {
+        tokio::select! {
+            accepted = listener.accept() => {
+                let (stream, peer) = accepted?;
+                let app = app.clone().layer(axum::Extension(ConnectInfo(peer)));
+                let mut stop = stop_rx.clone();
+                connections.spawn(async move {
+                    let mut builder = hyper::server::conn::http1::Builder::new();
+                    builder.title_case_headers(true)
+                        .timer(TokioTimer::new())
+                        .header_read_timeout(super::wire::IDLE_TIMEOUT);
+                    let connection = builder.serve_connection(TokioIo::new(stream), TowerToHyperService::new(app));
+                    tokio::pin!(connection);
+                    tokio::select! {
+                        result = &mut connection => { if let Err(error) = result { tracing::debug!(%peer, %error, "HTTP connection ended"); } }
+                        _ = stop.changed() => { connection.as_mut().graceful_shutdown(); let _ = connection.await; }
+                    }
+                });
+            }
+            _ = &mut shutdown_rx => break,
+            _ = connections.join_next(), if !connections.is_empty() => {}
+        }
+    }
+    let _ = stop_tx.send(true);
+    while connections.join_next().await.is_some() {}
 
     Ok(())
 }

@@ -926,7 +926,6 @@ const ruleForm = ref({
   password: "",
   serverName: "UNIX Type: L8",
   allowAnonymous: false,
-  rdpFlags: "",
 });
 
 interface ExploitPathForm {
@@ -1018,11 +1017,9 @@ const isCredentialRuleForm = computed(() =>
         "imap",
         "ssh",
         "ftp",
-        "rdp",
         "telnet",
         "mysql",
         "postgresql",
-        "ldap",
       ].includes(ruleForm.value.protocol),
 );
 const showBannerField = computed(() =>
@@ -1030,7 +1027,7 @@ const showBannerField = computed(() =>
     ? currentProtocolCapability.value?.fields.some(
         (field) => field.path === "banner",
       )
-    : ["redis", "smtp", "pop3", "imap", "ssh", "ftp", "telnet"].includes(
+    : ["smtp", "pop3", "imap", "ssh", "ftp", "telnet"].includes(
         ruleForm.value.protocol,
       ),
 );
@@ -1063,25 +1060,34 @@ const resetProtocolSpecificForm = (protocol: SimulationProtocol) => {
   ruleForm.value.password = protocol === "redis" ? "redis123" : "";
   ruleForm.value.serverName = "UNIX Type: L8";
   ruleForm.value.allowAnonymous = false;
-  ruleForm.value.rdpFlags = protocol === "rdp" ? "1" : "";
   dynamicFieldValues.value = {
     server_version:
-      protocol === "mysql"
-        ? "8.0.36-veydeck"
-        : protocol === "postgresql"
-          ? "16.2-veydeck"
-          : protocol === "mongodb"
-            ? "7.0.14-veydeck"
-            : protocol === "memcached"
-              ? "1.6.24"
-              : "",
+      protocol === "redis"
+        ? "6.2.14"
+        : protocol === "dns"
+          ? "9.18.30"
+          : protocol === "mysql"
+            ? "8.0.36-veydeck"
+            : protocol === "postgresql"
+              ? "16.2-veydeck"
+              : protocol === "mongodb"
+                ? "7.0.14-veydeck"
+                : protocol === "memcached"
+                  ? "1.6.24"
+                  : "",
     hostname: protocol === "mongodb" ? "mongodb-veydeck" : "",
     max_wire_version: protocol === "mongodb" ? "21" : "",
     databases: "",
-    server_name: protocol === "smb" ? "Veydeck" : "",
+    server_name:
+      protocol === "smb"
+        ? "Veydeck"
+        : protocol === "dns"
+          ? "dns.veydeck.local"
+          : "",
     domain: protocol === "smb" ? "LAB" : "",
-    shares: "",
     base_dn: protocol === "ldap" ? "dc=lab,dc=example" : "",
+    vendor_name: protocol === "ldap" ? "OpenLDAP" : "",
+    vendor_version: protocol === "ldap" ? "2.6.8" : "",
     prompt: protocol === "telnet" ? "$ " : "",
     default_ipv4: protocol === "dns" ? "192.0.2.53" : "",
     ttl: protocol === "dns" ? "60" : "",
@@ -1121,22 +1127,19 @@ const resetProtocolSpecificForm = (protocol: SimulationProtocol) => {
 };
 
 const defaultProtocolBanner = (protocol: SimulationProtocol) => {
-  if (protocol === "smtp") return "220 mail.veydeck.local ESMTP";
-  if (protocol === "pop3") return "+OK POP3 server ready";
-  if (protocol === "imap") return "* OK IMAP4rev1 Service Ready";
+  if (protocol === "smtp") return "mail.veydeck.local ESMTP";
+  if (protocol === "pop3") return "POP3 server ready";
+  if (protocol === "imap") return "IMAP4rev1 Service Ready";
   if (protocol === "ssh") return "SSH-2.0-OpenSSH_8.9p1 Ubuntu-3ubuntu0.1";
   if (protocol === "ftp") return "ProFTPD 1.3.5e Server ready.";
-  if (protocol === "redis") return "Redis server ready";
   if (protocol === "telnet") return "Embedded Linux 4.19";
   return "";
 };
 
 const defaultCredentialUsername = (protocol: SimulationProtocol) => {
   if (protocol === "ssh") return "root";
-  if (protocol === "rdp") return "administrator";
   if (protocol === "mysql") return "app";
   if (protocol === "postgresql") return "postgres";
-  if (protocol === "ldap") return "cn=reader,dc=lab,dc=example";
   return "admin";
 };
 
@@ -1156,7 +1159,6 @@ const openNewRuleDialog = () => {
     password: "",
     serverName: "UNIX Type: L8",
     allowAnonymous: false,
-    rdpFlags: "",
   };
   resetProtocolSpecificForm("http");
   ruleEditorMode.value = "guided";
@@ -1300,7 +1302,7 @@ const buildRuleConfig = () => {
         .map((item) => [item.key, item.value]),
     );
     return {
-      banner: ruleForm.value.banner || undefined,
+      server_version: dynamicFieldValues.value.server_version || undefined,
       require_auth: ruleForm.value.requireAuth,
       password: ruleForm.value.password || undefined,
       keys,
@@ -1380,15 +1382,14 @@ const buildRuleConfig = () => {
     return {
       server_name: dynamicFieldValues.value.server_name || "Veydeck",
       domain: dynamicFieldValues.value.domain || "LAB",
-      shares: splitDynamicList("shares"),
     };
   }
 
   if (protocol === "ldap") {
     return {
       base_dn: dynamicFieldValues.value.base_dn || "dc=lab,dc=example",
-      credentials: buildCredentialsConfig(),
-      entries: [],
+      vendor_name: dynamicFieldValues.value.vendor_name || undefined,
+      vendor_version: dynamicFieldValues.value.vendor_version || undefined,
     };
   }
 
@@ -1399,6 +1400,8 @@ const buildRuleConfig = () => {
           .filter((item) => item.key)
           .map((item) => [item.key, item.value]),
       ),
+      server_version: dynamicFieldValues.value.server_version || undefined,
+      server_name: dynamicFieldValues.value.server_name || undefined,
       default_ipv4: dynamicFieldValues.value.default_ipv4 || undefined,
       ttl: parseInt(dynamicFieldValues.value.ttl || "60", 10) || 60,
     };
@@ -1450,10 +1453,7 @@ const buildRuleConfig = () => {
     };
   }
 
-  return {
-    flags: parseInt(ruleForm.value.rdpFlags, 10) || undefined,
-    credentials: buildCredentialsConfig(),
-  };
+  return {};
 };
 
 const splitDynamicList = (path: string) =>
@@ -2702,16 +2702,6 @@ const handleDownloadPcap = async (row: SimInstance) => {
                 t("app.simulation.rules.fields.allowAnonymousHint")
               }}</span>
             </div>
-          </div>
-          <div v-if="ruleForm.protocol === 'rdp'" class="form-group">
-            <label>{{ t("app.simulation.rules.fields.rdpFlags") }}</label>
-            <VeyInput
-              v-model="ruleForm.rdpFlags"
-              type="number"
-              :placeholder="
-                t('app.simulation.rules.fields.rdpFlagsPlaceholder')
-              "
-            />
           </div>
         </div>
 

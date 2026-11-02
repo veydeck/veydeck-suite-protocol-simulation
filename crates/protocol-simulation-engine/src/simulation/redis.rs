@@ -24,37 +24,54 @@ struct RedisCommand {
     args: Vec<String>,
 }
 
-fn parse_redis_command(input: &[u8]) -> Option<RedisCommand> {
-    let text = std::str::from_utf8(input)
-        .ok()?
-        .trim_matches(|ch| ch == '\r' || ch == '\n');
-    if text.is_empty() {
-        return None;
+fn parse_redis_command(input: &[u8]) -> anyhow::Result<Option<(RedisCommand, usize)>> {
+    fn line(input: &[u8], offset: &mut usize) -> Option<String> {
+        let length = input
+            .get(*offset..)?
+            .windows(2)
+            .position(|b| b == b"\r\n")?;
+        let text = std::str::from_utf8(&input[*offset..*offset + length])
+            .ok()?
+            .to_string();
+        *offset += length + 2;
+        Some(text)
     }
-
-    if !text.starts_with('*') {
-        let mut parts = text.split_whitespace();
-        let name = parts.next()?.to_ascii_uppercase();
-        let args = parts.map(ToString::to_string).collect();
-        return Some(RedisCommand { name, args });
-    }
-
-    let mut lines = text.lines().map(str::trim_end);
-    let array_len = lines.next()?.strip_prefix('*')?.parse::<usize>().ok()?;
-    let mut values = Vec::with_capacity(array_len);
-
-    for _ in 0..array_len {
-        let bulk_header = lines.next()?;
-        if !bulk_header.starts_with('$') {
-            return None;
+    let mut offset = 0;
+    let Some(header) = line(input, &mut offset) else {
+        return Ok(None);
+    };
+    let mut values = Vec::new();
+    if let Some(count) = header.strip_prefix('*') {
+        let count: usize = count.parse()?;
+        anyhow::ensure!((1..=1024).contains(&count), "invalid RESP array length");
+        for _ in 0..count {
+            let Some(header) = line(input, &mut offset) else {
+                return Ok(None);
+            };
+            let length: usize = header
+                .strip_prefix('$')
+                .ok_or_else(|| anyhow::anyhow!("expected RESP bulk string"))?
+                .parse()?;
+            anyhow::ensure!(
+                length <= super::wire::MAX_FRAME,
+                "RESP bulk string too large"
+            );
+            if input.len() < offset + length + 2 {
+                return Ok(None);
+            }
+            anyhow::ensure!(
+                &input[offset + length..offset + length + 2] == b"\r\n",
+                "invalid RESP terminator"
+            );
+            values.push(std::str::from_utf8(&input[offset..offset + length])?.to_string());
+            offset += length + 2;
         }
-        let value = lines.next()?.to_string();
-        values.push(value);
+    } else {
+        values.extend(header.split_whitespace().map(str::to_string));
     }
-
-    let name = values.first()?.to_ascii_uppercase();
-    let args = values.into_iter().skip(1).collect();
-    Some(RedisCommand { name, args })
+    anyhow::ensure!(!values.is_empty(), "empty Redis command");
+    let name = values.remove(0).to_ascii_uppercase();
+    Ok(Some((RedisCommand { name, args: values }, offset)))
 }
 
 fn redis_simple(value: &str) -> Vec<u8> {
@@ -82,26 +99,38 @@ fn redis_array(values: &[String]) -> Vec<u8> {
 }
 
 fn redis_info_payload(config: &SimRedisConfig) -> String {
-    let mut lines = vec![
-        "# Server".to_string(),
-        "redis_version:6.2.14".to_string(),
-        "redis_git_sha1:00000000".to_string(),
-        "redis_mode:standalone".to_string(),
-        "os:Linux x86_64".to_string(),
-        "tcp_port:6379".to_string(),
-        "# Clients".to_string(),
-        "connected_clients:1".to_string(),
-        "# Memory".to_string(),
-        "used_memory_human:12.34M".to_string(),
-    ];
-
-    if let Some(server_info) = &config.server_info {
-        for (key, value) in server_info {
-            lines.push(format!("{}:{}", key, value));
-        }
+    let mut fields = std::collections::BTreeMap::from([
+        (
+            "redis_version".to_string(),
+            config
+                .server_version
+                .clone()
+                .unwrap_or_else(|| "6.2.14".to_string()),
+        ),
+        ("redis_git_sha1".to_string(), "00000000".to_string()),
+        ("redis_mode".to_string(), "standalone".to_string()),
+        ("os".to_string(), "Linux x86_64".to_string()),
+        ("tcp_port".to_string(), "6379".to_string()),
+        ("connected_clients".to_string(), "1".to_string()),
+        ("used_memory_human".to_string(), "12.34M".to_string()),
+    ]);
+    if let Some(info) = &config.server_info {
+        fields.extend(info.clone());
     }
-
-    lines.join("\r\n")
+    // The dedicated version field is authoritative across identity queries.
+    if let Some(version) = &config.server_version {
+        fields.insert("redis_version".into(), version.clone());
+    }
+    let version = fields
+        .remove("redis_version")
+        .expect("default version is present");
+    let mut lines = vec!["# Server".to_string(), format!("redis_version:{version}")];
+    lines.extend(
+        fields
+            .into_iter()
+            .map(|(key, value)| format!("{key}:{value}")),
+    );
+    lines.join("\r\n") + "\r\n"
 }
 
 fn redis_custom_response(
@@ -146,18 +175,33 @@ fn redis_response_for_command(
     command: &RedisCommand,
     authed: &mut bool,
 ) -> (Vec<u8>, String) {
-    if let Some((response, event_type)) = redis_custom_response(config, command) {
-        return (response, event_type);
-    }
-
     let require_auth = config.require_auth.unwrap_or(false);
-    if require_auth && !*authed && !matches!(command.name.as_str(), "AUTH" | "PING") {
+    if require_auth && !*authed && command.name != "AUTH" {
         return (
             redis_error("NOAUTH Authentication required."),
             "redis_command".to_string(),
         );
     }
 
+    if let Some((response, event_type)) = redis_custom_response(config, command) {
+        return (response, event_type);
+    }
+
+    let valid_arity = match command.name.as_str() {
+        "PING" | "INFO" => command.args.len() <= 1,
+        "GET" | "KEYS" => command.args.len() == 1,
+        "AUTH" => matches!(command.args.len(), 1 | 2),
+        _ => true,
+    };
+    if !valid_arity {
+        return (
+            redis_error(&format!(
+                "ERR wrong number of arguments for '{}' command",
+                command.name.to_ascii_lowercase()
+            )),
+            "redis_command".into(),
+        );
+    }
     match command.name.as_str() {
         "PING" => {
             let response = command
@@ -231,10 +275,6 @@ async fn handle_redis_connection(
     let client_port = peer.port();
     let mut authed = !ctx.config.require_auth.unwrap_or(false);
 
-    if let Some(banner) = &ctx.config.banner {
-        stream.write_all(&redis_simple(banner)).await?;
-    }
-
     let connection_draft = SimLogDraft {
         rule_id: ctx.rule_id.clone(),
         node_id: ctx.node_id.clone(),
@@ -248,43 +288,38 @@ async fn handle_redis_connection(
     report_sim_log_async(ctx.callback_url.clone(), connection_draft);
 
     let mut buffer = vec![0_u8; 4096];
+    let mut pending = Vec::new();
     loop {
-        let read_len = stream.read(&mut buffer).await?;
+        let read_len =
+            tokio::time::timeout(super::wire::IDLE_TIMEOUT, stream.read(&mut buffer)).await??;
         if read_len == 0 {
+            anyhow::ensure!(pending.is_empty(), "truncated Redis request");
             break;
         }
-
-        let payload = &buffer[..read_len];
-        let Some(command) = parse_redis_command(payload) else {
-            stream
-                .write_all(&redis_error("ERR Protocol error: invalid request"))
-                .await?;
-            continue;
-        };
-
-        let (response, event_type) = redis_response_for_command(&ctx.config, &command, &mut authed);
-        let summary = if command.args.is_empty() {
-            format!("Redis command: {}", command.name)
-        } else {
-            format!("Redis command: {} {}", command.name, command.args.join(" "))
-        };
-        let payload_hex = Some(super::common::encode_hex(
-            &payload[..payload.len().min(512)],
-        ));
-
-        let draft = SimLogDraft {
-            rule_id: ctx.rule_id.clone(),
-            node_id: ctx.node_id.clone(),
-            client_ip: client_ip.clone(),
-            client_port,
-            server_port: ctx.port,
-            event_type,
-            detail_summary: summary,
-            payload_hex,
-        };
-        report_sim_log_async(ctx.callback_url.clone(), draft);
-
-        stream.write_all(&response).await?;
+        pending.extend_from_slice(&buffer[..read_len]);
+        anyhow::ensure!(
+            pending.len() <= super::wire::MAX_FRAME,
+            "Redis request too large"
+        );
+        while let Some((command, consumed)) = parse_redis_command(&pending)? {
+            let (response, event_type) =
+                redis_response_for_command(&ctx.config, &command, &mut authed);
+            report_sim_log_async(
+                ctx.callback_url.clone(),
+                SimLogDraft {
+                    rule_id: ctx.rule_id.clone(),
+                    node_id: ctx.node_id.clone(),
+                    client_ip: client_ip.clone(),
+                    client_port,
+                    server_port: ctx.port,
+                    event_type,
+                    detail_summary: format!("Redis command: {}", command.name),
+                    payload_hex: Some(super::common::encode_hex(&pending[..consumed.min(512)])),
+                },
+            );
+            stream.write_all(&response).await?;
+            pending.drain(..consumed);
+        }
     }
 
     Ok(())
@@ -338,4 +373,85 @@ pub async fn start_redis_simulation(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn info_has_one_authoritative_version() {
+        let config = SimRedisConfig {
+            server_version: Some("7.2.5".into()),
+            server_info: Some(std::collections::BTreeMap::from([
+                ("redis_version".into(), "6.0".into()),
+                ("os".into(), "FreeBSD".into()),
+            ])),
+            ..Default::default()
+        };
+        let info = redis_info_payload(&config);
+        assert_eq!(info.matches("redis_version:").count(), 1);
+        assert!(info.contains("redis_version:7.2.5\r\n"));
+        assert!(info.contains("os:FreeBSD\r\n"));
+    }
+    #[test]
+    fn parses_fragmented_and_pipelined_resp_by_length() {
+        let request = b"*2\r\n$4\r\nECHO\r\n$4\r\na\r\nb\r\nPING\r\n";
+        assert!(parse_redis_command(&request[..20]).unwrap().is_none());
+        let (command, used) = parse_redis_command(request).unwrap().unwrap();
+        assert_eq!(command.args, ["a\r\nb"]);
+        assert_eq!(
+            parse_redis_command(&request[used..])
+                .unwrap()
+                .unwrap()
+                .0
+                .name,
+            "PING"
+        );
+        assert!(parse_redis_command(b"*99999999\r\n").is_err());
+    }
+    #[test]
+    fn authentication_gates_info_and_custom_responses() {
+        let config = SimRedisConfig {
+            require_auth: Some(true),
+            password: Some("secret".into()),
+            ..Default::default()
+        };
+        let mut authed = false;
+        let command = |name: &str, args: Vec<String>| RedisCommand {
+            name: name.into(),
+            args,
+        };
+        assert!(
+            redis_response_for_command(&config, &command("INFO", vec![]), &mut authed)
+                .0
+                .starts_with(b"-NOAUTH")
+        );
+        assert_eq!(
+            redis_response_for_command(
+                &config,
+                &command("AUTH", vec!["secret".into()]),
+                &mut authed
+            )
+            .0,
+            b"+OK\r\n"
+        );
+        assert!(
+            redis_response_for_command(&config, &command("INFO", vec![]), &mut authed)
+                .0
+                .starts_with(b"$")
+        );
+    }
+    #[test]
+    fn invalid_get_arity_returns_protocol_error_instead_of_nil() {
+        let config = SimRedisConfig::default();
+        let mut authed = true;
+        let command = RedisCommand {
+            name: "GET".into(),
+            args: vec!["/".into(), "HTTP/1.0".into()],
+        };
+        assert_eq!(
+            redis_response_for_command(&config, &command, &mut authed).0,
+            b"-ERR wrong number of arguments for 'get' command\r\n"
+        );
+    }
 }

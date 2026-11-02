@@ -80,31 +80,37 @@ async fn read_startup_packet<Stream>(stream: &mut Stream) -> anyhow::Result<Vec<
 where
     Stream: AsyncRead + Unpin,
 {
-    let length = stream.read_u32().await? as usize;
-    if !(8..=MAX_PACKET_SIZE).contains(&length) {
-        bail!("invalid PostgreSQL startup packet length: {length}");
-    }
-    let mut packet = vec![0; length - 4];
-    stream.read_exact(&mut packet).await?;
-    Ok(packet)
+    tokio::time::timeout(crate::simulation::wire::IDLE_TIMEOUT, async {
+        let length = stream.read_u32().await? as usize;
+        if !(8..=MAX_PACKET_SIZE).contains(&length) {
+            bail!("invalid PostgreSQL startup packet length: {length}");
+        }
+        let mut packet = vec![0; length - 4];
+        stream.read_exact(&mut packet).await?;
+        Ok(packet)
+    })
+    .await?
 }
 
 async fn read_frontend_message<Stream>(stream: &mut Stream) -> anyhow::Result<Option<(u8, Vec<u8>)>>
 where
     Stream: AsyncRead + Unpin,
 {
-    let kind = match stream.read_u8().await {
-        Ok(kind) => kind,
-        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(error) => return Err(error.into()),
-    };
-    let length = stream.read_u32().await? as usize;
-    if !(4..=MAX_PACKET_SIZE).contains(&length) {
-        bail!("invalid PostgreSQL frontend message length: {length}");
-    }
-    let mut body = vec![0; length - 4];
-    stream.read_exact(&mut body).await?;
-    Ok(Some((kind, body)))
+    tokio::time::timeout(crate::simulation::wire::IDLE_TIMEOUT, async {
+        let kind = match stream.read_u8().await {
+            Ok(kind) => kind,
+            Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        let length = stream.read_u32().await? as usize;
+        if !(4..=MAX_PACKET_SIZE).contains(&length) {
+            bail!("invalid PostgreSQL frontend message length: {length}");
+        }
+        let mut body = vec![0; length - 4];
+        stream.read_exact(&mut body).await?;
+        Ok(Some((kind, body)))
+    })
+    .await?
 }
 
 fn startup_parameter<'a>(packet: &'a [u8], name: &str) -> Option<&'a str> {
@@ -193,9 +199,22 @@ where
         startup = read_startup_packet(stream).await?;
     }
     if startup.get(..4) != Some(PROTOCOL_VERSION_3.as_slice()) {
-        stream
-            .write_all(&error_response("0A000", "unsupported protocol version"))
-            .await?;
+        let version = startup
+            .get(..4)
+            .map(|bytes| u32::from_be_bytes(bytes.try_into().unwrap()))
+            .unwrap_or(0);
+        let diagnostic = format!(
+            "unsupported frontend protocol {}.{}: server supports 3.0",
+            version >> 16,
+            version & 0xffff
+        );
+        let body = [
+            b"SFATAL\0VFATAL\0C0A000\0M".as_slice(),
+            diagnostic.as_bytes(),
+            b"\0\0",
+        ]
+        .concat();
+        stream.write_all(&backend_message(b'E', &body)).await?;
         return Ok(());
     }
     observe(

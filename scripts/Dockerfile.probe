@@ -1,0 +1,7 @@
+FROM ubuntu:24.04
+ARG NMAP_VERSION=7.94+git20230807.3be01efb1+dfsg-3build2
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends python3 nmap="${NMAP_VERSION}" ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /workspace
+CMD ["python3", "scripts/probe-protocols.py", "--nmap-data", "/usr/share/nmap"]

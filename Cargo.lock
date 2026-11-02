@@ -1361,6 +1361,8 @@ dependencies = [
  "axum",
  "base64",
  "chrono",
+ "hyper",
+ "hyper-util",
  "protocol-simulation-common",
  "reqwest",
  "serde",

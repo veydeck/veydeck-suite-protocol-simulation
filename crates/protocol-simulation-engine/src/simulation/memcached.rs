@@ -27,7 +27,20 @@ fn stats_response(config: &SimMemcachedConfig, settings: bool) -> String {
     );
     if let Some(stats) = &config.stats {
         for (key, value) in stats {
-            if !key.trim().is_empty() && !key.chars().any(char::is_whitespace) {
+            if ![
+                "pid",
+                "uptime",
+                "time",
+                "version",
+                "pointer_size",
+                "curr_connections",
+                "total_connections",
+                "maxconns",
+            ]
+            .contains(&key.as_str())
+                && !key.trim().is_empty()
+                && !key.chars().any(char::is_whitespace)
+            {
                 response.push_str(&format!("STAT {key} {value}\r\n"));
             }
         }
@@ -163,5 +176,19 @@ mod tests {
             },
         );
         assert_eq!(response, "VERSION 1.6.32\r\n");
+    }
+    #[test]
+    fn custom_stats_cannot_duplicate_authoritative_version() {
+        let config = SimMemcachedConfig {
+            server_version: Some("1.6.32".into()),
+            stats: Some(std::collections::BTreeMap::from([
+                ("version".into(), "wrong".into()),
+                ("custom".into(), "value".into()),
+            ])),
+        };
+        let response = stats_response(&config, false);
+        assert_eq!(response.matches("STAT version ").count(), 1);
+        assert!(response.contains("STAT version 1.6.32\r\n"));
+        assert!(response.contains("STAT custom value\r\n"));
     }
 }
